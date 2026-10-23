@@ -1,241 +1,549 @@
-from __future__ import annotations
 
-from io import BytesIO
+import json
+from pathlib import Path
 
+import joblib
 import pandas as pd
 import streamlit as st
-from pandas.api.types import is_numeric_dtype
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
+
+BASE_DIR = Path(__file__).parent
+MODEL_PATH = BASE_DIR / "discount_model.pkl"
+METRICS_PATH = BASE_DIR / "metrics.json"
+
+st.set_page_config(
+    page_title="Cart Session Intelligence",
+    page_icon="🛍️",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+
+# ---------- PROFESSIONAL STYLING ----------
+st.markdown("""
+<style>
+    .stApp {
+        background: #0b1120;
+        color: #e5e7eb;
+    }
+
+    [data-testid="stSidebar"] {
+        background: #111a2e;
+        border-right: 1px solid #26334c;
+    }
+
+    [data-testid="stHeader"] {
+        background: rgba(11, 17, 32, 0.9);
+    }
+
+    .hero {
+        padding: 26px 28px;
+        border-radius: 18px;
+        background: linear-gradient(120deg, #172554, #14213d 65%, #102b3f);
+        border: 1px solid #2b4165;
+        margin-bottom: 24px;
+    }
+
+    .hero h1 {
+        color: #f8fafc;
+        font-size: 30px;
+        margin: 0 0 8px 0;
+    }
+
+    .hero p {
+        color: #b8c7dc;
+        font-size: 15px;
+        margin: 0;
+    }
+
+    .section-heading {
+        font-size: 19px;
+        font-weight: 650;
+        color: #f1f5f9;
+        margin: 12px 0 6px 0;
+    }
+
+    .muted {
+        color: #9caec7;
+        font-size: 13px;
+    }
+
+    .result-card {
+        background: #111c31;
+        border: 1px solid #30415f;
+        border-radius: 15px;
+        padding: 20px;
+        min-height: 120px;
+    }
+
+    .result-label {
+        color: #9fb0c8;
+        font-size: 13px;
+        margin-bottom: 8px;
+    }
+
+    .result-value {
+        color: #f8fafc;
+        font-size: 27px;
+        font-weight: 700;
+    }
+
+    div.stButton > button[kind="primary"],
+    div.stFormSubmitButton > button[kind="primary"] {
+        background: #2563eb;
+        border: 1px solid #3b82f6;
+        color: white;
+        border-radius: 9px;
+        min-height: 46px;
+        font-weight: 600;
+    }
+
+    div.stButton > button[kind="primary"]:hover,
+    div.stFormSubmitButton > button[kind="primary"]:hover {
+        background: #1d4ed8;
+        border-color: #60a5fa;
+    }
+
+    div[data-testid="stMetric"] {
+        background: #111c31;
+        border: 1px solid #263854;
+        padding: 14px;
+        border-radius: 12px;
+    }
+
+    [data-testid="stProgressBar"] > div > div {
+        background-color: #3b82f6;
+    }
+
+    hr {
+        border-color: #263854;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
-DATA_URL = (
-    "https://docs.google.com/spreadsheets/d/"
-    "1bYPFDS7A1YLlJ_rFsla-C_dhUZ-mTg3LLJjJAFRFuR4/export?format=csv"
-)
-TARGET = "should_receive_discount"
-ID_COLUMNS = ["user_id"]
-NOMINAL_COLUMNS = {
-    "gender",
-    "traffic_source",
-    "product_category",
-    "previous_review_sentiment",
-}
+# ---------- LOAD MODEL AND METRICS ----------
+@st.cache_resource
+def load_model():
+    return joblib.load(MODEL_PATH)
 
 
-@st.cache_data(ttl=3600)
-def load_shared_data() -> pd.DataFrame:
-    return pd.read_csv(DATA_URL)
+@st.cache_data
+def load_metrics():
+    if METRICS_PATH.exists():
+        with open(METRICS_PATH, "r", encoding="utf-8") as file:
+            return json.load(file)
+    return {}
 
 
-def prepare_data(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    if TARGET not in data.columns:
-        raise ValueError(f"The CSV must contain the target column '{TARGET}'.")
-
-    labeled = data.dropna(subset=[TARGET]).copy()
-    target_values = set(labeled[TARGET].unique())
-    if not target_values.issubset({0, 1, False, True}):
-        raise ValueError(f"'{TARGET}' must contain only 0/1 labels.")
-
-    features = labeled.drop(columns=[TARGET, *ID_COLUMNS], errors="ignore")
-    features = features.dropna(axis=1, how="all")
-    if features.empty:
-        raise ValueError("No usable feature columns were found in the CSV.")
-
-    target = labeled[TARGET].astype(int)
-    counts = target.value_counts()
-    if len(counts) != 2 or counts.min() < 2:
-        raise ValueError("The target needs at least two rows for each 0/1 label.")
-
-    return features, target
-
-
-def build_model(features: pd.DataFrame) -> Pipeline:
-    categorical_columns = [
-        column
-        for column in features.columns
-        if column in NOMINAL_COLUMNS or not is_numeric_dtype(features[column])
+# Keep categorical inputs consistent with the original training pipeline.
+@st.cache_data
+def get_feature_names():
+    return [
+        "age",
+        "gender",
+        "annual_income",
+        "device_mobile",
+        "traffic_source",
+        "product_category",
+        "current_session_duration_sec",
+        "time_spent_deviation",
+        "pages_viewed",
+        "basket_icon_click",
+        "cart_items_count_this_session",
+        "cart_total_value",
+        "scrolled_to_reviews",
+        "checked_delivery_pdp",
+        "saw_checkout",
+        "sign_in",
+        "is_returning_user",
+        "lifetime_purchases_count",
+        "customer_conversion_rate",
+        "days_since_last_discount",
+        "previous_review_sentiment",
+        "social_channels_followed_count",
     ]
-    numeric_columns = [
-        column for column in features.columns if column not in categorical_columns
-    ]
-
-    preprocess = ColumnTransformer(
-        transformers=[
-            (
-                "numeric",
-                SimpleImputer(strategy="median"),
-                numeric_columns,
-            ),
-            (
-                "categorical",
-                Pipeline(
-                    steps=[
-                        ("imputer", SimpleImputer(strategy="most_frequent")),
-                        ("encoder", OneHotEncoder(handle_unknown="ignore")),
-                    ]
-                ),
-                categorical_columns,
-            ),
-        ],
-        remainder="drop",
-    )
-    return Pipeline(
-        steps=[
-            ("preprocess", preprocess),
-            (
-                "classifier",
-                RandomForestClassifier(
-                    n_estimators=300,
-                    class_weight="balanced",
-                    random_state=42,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
 
 
-st.set_page_config(page_title="Cart Session Classifier", page_icon="🛒", layout="wide")
-st.title("Cart Session Classifier")
-st.caption("Random Forest demonstration using the shared shopping-session data")
-
-st.warning(
-    "The spreadsheet target is **`should_receive_discount`**, not a recorded "
-    "purchase or cart-abandonment outcome. This app therefore predicts the "
-    "existing discount label; it does not validate abandonment prediction or "
-    "the causal impact of discounts."
-)
-
-source = st.radio(
-    "Choose data source",
-    ["Shared Google Sheet", "Upload CSV"],
-    horizontal=True,
-)
+if not MODEL_PATH.exists():
+    st.error("Model file not found. Please add discount_model.pkl to your repository.")
+    st.stop()
 
 try:
-    if source == "Shared Google Sheet":
-        with st.spinner("Loading the shared spreadsheet..."):
-            data = load_shared_data()
-    else:
-        uploaded_data = st.file_uploader("Upload labeled session data (CSV)", type="csv")
-        if uploaded_data is None:
-            st.info("Upload a CSV with a `should_receive_discount` column to continue.")
-            st.stop()
-        data = pd.read_csv(BytesIO(uploaded_data.getvalue()))
-
-    features, target = prepare_data(data)
-except (ValueError, pd.errors.ParserError, OSError) as error:
-    st.error(f"Could not use this dataset: {error}")
-    st.stop()
-except Exception as error:
-    st.error(f"Could not load the dataset: {error}")
+    model = load_model()
+    metrics = load_metrics()
+except Exception as exc:
+    st.error("The model or metrics could not be loaded.")
+    st.caption(f"Technical details: {exc}")
     st.stop()
 
-st.subheader("Dataset overview")
-overview, positive_rate, feature_count = st.columns(3)
-overview.metric("Labeled sessions", f"{len(target):,}")
-positive_rate.metric("Discount label = 1", f"{target.mean():.1%}")
-feature_count.metric("Model features", f"{features.shape[1]}")
-st.dataframe(data.head(10), use_container_width=True)
 
-train_features, test_features, train_target, test_target = train_test_split(
-    features,
-    target,
-    test_size=0.2,
-    random_state=42,
-    stratify=target,
-)
-model = build_model(features)
+# ---------- SIDEBAR ----------
+with st.sidebar:
+    st.markdown("## 🛍️ Cart Intelligence")
+    st.caption("MACHINE LEARNING · CASE STUDY")
+    st.divider()
 
-with st.spinner("Training and evaluating the Random Forest..."):
-    model.fit(train_features, train_target)
-    predictions = model.predict(test_features)
-    probabilities = model.predict_proba(test_features)[:, 1]
-
-st.subheader("Held-out evaluation")
-st.caption("Metrics use a stratified 80/20 split. Class 1 is the existing discount label.")
-metric_columns = st.columns(6)
-metric_values = [
-    ("Accuracy", accuracy_score(test_target, predictions)),
-    ("Balanced accuracy", balanced_accuracy_score(test_target, predictions)),
-    ("Precision (label 1)", precision_score(test_target, predictions, zero_division=0)),
-    ("Recall (label 1)", recall_score(test_target, predictions, zero_division=0)),
-    ("F1 (label 1)", f1_score(test_target, predictions, zero_division=0)),
-    ("ROC AUC", roc_auc_score(test_target, probabilities)),
-]
-for column, (label, value) in zip(metric_columns, metric_values):
-    column.metric(label, f"{value:.3f}")
-
-confusion = confusion_matrix(test_target, predictions, labels=[0, 1])
-left, right = st.columns(2)
-with left:
-    st.markdown("**Confusion matrix**")
-    st.dataframe(
-        pd.DataFrame(
-            confusion,
-            index=["Actual 0", "Actual 1"],
-            columns=["Predicted 0", "Predicted 1"],
-        ),
-        use_container_width=True,
+    st.markdown("### About the project")
+    st.write(
+        "A machine-learning classifier that analyses shopping-session "
+        "features and predicts the dataset's existing label."
     )
 
-with right:
-    st.markdown("**Most influential features**")
-    feature_names = model.named_steps["preprocess"].get_feature_names_out()
-    importances = model.named_steps["classifier"].feature_importances_
-    importance_table = (
-        pd.DataFrame({"Feature": feature_names, "Importance": importances})
-        .sort_values("Importance", ascending=False)
-        .head(12)
-        .set_index("Feature")
-    )
-    st.bar_chart(importance_table)
+    st.markdown("### Model")
+    st.write("**Algorithm:** Random Forest")
+    st.write("**Task:** Binary classification")
+    st.write("**Target:** `should_receive_discount`")
 
-st.subheader("Score new sessions")
-st.caption(
-    "Upload one or more unlabeled session rows. Include the same feature columns "
-    "used for training; `user_id` and the target column are not required."
+    if metrics and metrics.get("accuracy") is not None:
+        st.divider()
+        st.metric(
+            "Test accuracy",
+            f"{float(metrics['accuracy']):.1%}"
+        )
+        st.caption("Reported held-out test result.")
+
+    st.divider()
+    st.caption("Educational case study · Not a production decision system")
+
+
+# ---------- PAGE HEADER ----------
+st.markdown("""
+<div class="hero">
+    <h1>Cart Session Intelligence</h1>
+    <p>
+        Analyse customer-session attributes and generate a model prediction
+        using your existing discount-classification dataset.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+# The label meanings have not been confirmed by the dataset documentation.
+st.info(
+    "Interpretation note: the model predicts the existing "
+    "`should_receive_discount` dataset label. The meanings of labels 0 and 1 "
+    "have not been independently verified. This is not a direct prediction "
+    "of purchase completion or cart abandonment."
 )
-scoring_file = st.file_uploader(
-    "Upload sessions to score (CSV)",
-    type="csv",
-    key="scoring_csv",
+
+# ---------- CUSTOMER INPUT FORM ----------
+st.markdown('<div class="section-heading">Customer session</div>',
+            unsafe_allow_html=True)
+st.markdown(
+    '<p class="muted">Enter the session details below, then run the classifier.</p>',
+    unsafe_allow_html=True
 )
-if scoring_file is not None:
+
+with st.form("customer_session_form"):
+    tab1, tab2, tab3 = st.tabs([
+        "Shopping activity",
+        "Customer profile",
+        "Engagement history"
+    ])
+
+    with tab1:
+        st.markdown("#### Current session")
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            current_session_duration_sec = st.number_input(
+                "Session duration (seconds)", min_value=0.0,
+                value=180.0, step=10.0
+            )
+            pages_viewed = st.number_input(
+                "Pages viewed", min_value=0, max_value=1000, value=4
+            )
+            traffic_source = st.selectbox(
+                "Traffic source code", [1, 2, 3, 4]
+            )
+
+        with c2:
+            cart_items_count_this_session = st.number_input(
+                "Cart items", min_value=0, max_value=100, value=1
+            )
+            cart_total_value = st.number_input(
+                "Cart total value", min_value=0.0,
+                value=50.0, step=5.0
+            )
+            product_category = st.selectbox(
+                "Product category code", [0, 1, 2, 3]
+            )
+
+        with c3:
+            basket_icon_click = st.selectbox(
+                "Clicked basket?",
+                [0, 1],
+                format_func=lambda x: "Yes" if x else "No"
+            )
+            saw_checkout = st.selectbox(
+                "Viewed checkout?",
+                [0, 1],
+                format_func=lambda x: "Yes" if x else "No"
+            )
+            device_mobile = st.selectbox(
+                "Mobile device?",
+                [1, 0],
+                format_func=lambda x: "Yes" if x else "No"
+            )
+
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            scrolled_to_reviews = st.selectbox(
+                "Viewed reviews?",
+                [0, 1],
+                format_func=lambda x: "Yes" if x else "No"
+            )
+        with sc2:
+            checked_delivery_pdp = st.selectbox(
+                "Checked delivery information?",
+                [0, 1],
+                format_func=lambda x: "Yes" if x else "No"
+            )
+        with sc3:
+            time_spent_deviation = st.number_input(
+                "Time-spent deviation", value=0.0, step=1.0
+            )
+
+    with tab2:
+        st.markdown("#### Customer information")
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            age = st.number_input(
+                "Age", min_value=18, max_value=100, value=30
+            )
+            gender = st.selectbox("Gender code", [0, 1])
+            annual_income = st.number_input(
+                "Annual income", min_value=0.0,
+                value=50000.0, step=1000.0
+            )
+
+        with c2:
+            sign_in = st.selectbox(
+                "Signed in?",
+                [0, 1],
+                format_func=lambda x: "Yes" if x else "No"
+            )
+            is_returning_user = st.selectbox(
+                "Returning customer?",
+                [0, 1],
+                format_func=lambda x: "Yes" if x else "No"
+            )
+            lifetime_purchases_count = st.number_input(
+                "Lifetime purchases", min_value=0,
+                max_value=10000, value=2
+            )
+
+        with c3:
+            customer_conversion_rate = st.number_input(
+                "Historical conversion rate",
+                min_value=0.0, max_value=1.0,
+                value=0.10, step=0.01, format="%.3f"
+            )
+            days_since_last_discount = st.number_input(
+                "Days since last discount",
+                min_value=0, max_value=5000, value=999
+            )
+
+    with tab3:
+        st.markdown("#### Previous engagement")
+        c1, c2 = st.columns(2)
+
+        with c1:
+            previous_review_sentiment = st.selectbox(
+                "Previous review sentiment code", [0, 1, 2, 3]
+            )
+        with c2:
+            social_channels_followed_count = st.number_input(
+                "Social channels followed", min_value=0,
+                max_value=1000, value=2
+            )
+
+    st.divider()
+    submitted = st.form_submit_button(
+        "Run prediction",
+        type="primary",
+        use_container_width=True
+    )
+
+
+# ---------- PREDICTION ----------
+if submitted:
+    row = {
+        "age": age,
+        "gender": str(gender),
+        "annual_income": annual_income,
+        "device_mobile": str(device_mobile),
+        "traffic_source": str(traffic_source),
+        "product_category": str(product_category),
+        "current_session_duration_sec": current_session_duration_sec,
+        "time_spent_deviation": time_spent_deviation,
+        "pages_viewed": pages_viewed,
+        "basket_icon_click": str(basket_icon_click),
+        "cart_items_count_this_session": cart_items_count_this_session,
+        "cart_total_value": cart_total_value,
+        "scrolled_to_reviews": str(scrolled_to_reviews),
+        "checked_delivery_pdp": str(checked_delivery_pdp),
+        "saw_checkout": str(saw_checkout),
+        "sign_in": str(sign_in),
+        "is_returning_user": str(is_returning_user),
+        "lifetime_purchases_count": lifetime_purchases_count,
+        "customer_conversion_rate": customer_conversion_rate,
+        "days_since_last_discount": days_since_last_discount,
+        "previous_review_sentiment": str(previous_review_sentiment),
+        "social_channels_followed_count": social_channels_followed_count,
+    }
+
+    input_df = pd.DataFrame([row], columns=get_feature_names())
+
     try:
-        scoring_data = pd.read_csv(BytesIO(scoring_file.getvalue()))
-        missing_columns = sorted(set(features.columns) - set(scoring_data.columns))
-        if missing_columns:
-            st.error(f"Scoring CSV is missing required columns: {', '.join(missing_columns)}")
+        prediction = int(model.predict(input_df)[0])
+        probabilities = model.predict_proba(input_df)[0]
+
+        # Support standard sklearn classifiers and pipelines.
+        if hasattr(model, "classes_"):
+            classes = list(model.classes_)
+        elif hasattr(model, "named_steps"):
+            final_estimator = list(model.named_steps.values())[-1]
+            classes = list(final_estimator.classes_)
         else:
-            scores = model.predict_proba(scoring_data[features.columns])[:, 1]
-            results = scoring_data.copy()
-            results["predicted_discount_label"] = model.predict(
-                scoring_data[features.columns]
+            raise AttributeError(
+                "Unable to determine the model's class labels."
             )
-            results["probability_of_discount_label_1"] = scores
-            st.dataframe(results, use_container_width=True)
-            st.download_button(
-                "Download scored sessions",
-                results.to_csv(index=False).encode("utf-8"),
-                file_name="scored_sessions.csv",
-                mime="text/csv",
+
+        probability_by_class = {
+            int(label): float(probability)
+            for label, probability in zip(classes, probabilities)
+        }
+
+        predicted_probability = probability_by_class[prediction]
+
+        st.divider()
+        st.markdown(
+            '<div class="section-heading">Prediction result</div>',
+            unsafe_allow_html=True
+        )
+
+        r1, r2, r3 = st.columns(3)
+
+        with r1:
+            st.markdown(
+                f"""
+                <div class="result-card">
+                    <div class="result-label">Predicted dataset label</div>
+                    <div class="result-value">{prediction}</div>
+                </div>
+                """,
+                unsafe_allow_html=True
             )
-    except (ValueError, pd.errors.ParserError, OSError) as error:
-        st.error(f"Could not score this CSV: {error}")
-    except Exception as error:
-        st.error(f"Scoring failed: {error}")
+
+        with r2:
+            st.markdown(
+                f"""
+                <div class="result-card">
+                    <div class="result-label">Probability of predicted label</div>
+                    <div class="result-value">{predicted_probability:.1%}</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        with r3:
+            st.markdown(
+                f"""
+                <div class="result-card">
+                    <div class="result-label">Model</div>
+                    <div class="result-value">Random Forest</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        st.markdown("#### Probability by dataset label")
+
+        for class_label in sorted(probability_by_class):
+            probability = probability_by_class[class_label]
+            st.progress(
+                probability,
+                text=f"Label {class_label}: {probability:.1%}"
+            )
+
+        st.caption(
+            "These are model-estimated probabilities, not guarantees. "
+            "The predicted label should not be interpreted as discount "
+            "eligibility until the original label definition is verified."
+        )
+
+        st.download_button(
+            "Download prediction record (CSV)",
+            data=input_df.assign(
+                predicted_dataset_label=prediction,
+                predicted_label_probability=predicted_probability
+            ).to_csv(index=False).encode("utf-8"),
+            file_name="cart_session_prediction.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+    except Exception as exc:
+        st.error(
+            "Prediction failed. Please check that the saved model was "
+            "trained with the same feature names and preprocessing."
+        )
+        st.caption(f"Technical details: {exc}")
+
+
+# ---------- MODEL EVALUATION ----------
+with st.expander("Model evaluation"):
+    if not metrics:
+        st.write("No metrics.json file was found. Prediction can still work.")
+    else:
+        m1, m2 = st.columns(2)
+
+        with m1:
+            if metrics.get("accuracy") is not None:
+                st.metric(
+                    "Test accuracy",
+                    f"{float(metrics['accuracy']):.1%}"
+                )
+
+        with m2:
+            if metrics.get("test_size") is not None:
+                st.metric("Test records", int(metrics["test_size"]))
+
+        if metrics.get("confusion_matrix"):
+            st.markdown("#### Confusion matrix")
+            st.dataframe(
+                pd.DataFrame(
+                    metrics["confusion_matrix"],
+                    index=["Actual 0", "Actual 1"],
+                    columns=["Predicted 0", "Predicted 1"]
+                ),
+                use_container_width=True
+            )
+
+        report = metrics.get("classification_report", {})
+        report_rows = [
+            {"Class": label, **report[label]}
+            for label in ["0", "1", "macro avg", "weighted avg"]
+            if label in report
+        ]
+
+        if report_rows:
+            st.markdown("#### Classification report")
+            st.dataframe(
+                pd.DataFrame(report_rows).set_index("Class"),
+                use_container_width=True
+            )
+
+        st.caption(
+            "Test metrics evaluate prediction of the dataset labels. "
+            "They do not prove causal impact, increased sales, or reduced "
+            "discount spending."
+        )
+
+
+# ---------- FOOTER ----------
+st.divider()
+st.caption(
+    "Cart Session Intelligence · Machine Learning Case Study · "
+    "Predictions are experimental and should be validated before business use."
+)
